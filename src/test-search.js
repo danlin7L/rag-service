@@ -2,7 +2,7 @@
 
 import { search } from './search.js';
 import { pool } from './db.js';
-const question = 'Will a new drawer fit an older unit?';
+const question = 'Do golden retrievers excel in dog sports?';
 console.log("test-search.js, test: check检索结果准不准");
 
 const results = await search(question);

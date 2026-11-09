@@ -3,8 +3,9 @@
 import { pool } from './db.js';
 import { chunkText } from './chunker.js';
 import { embed } from './embed.js';
-
 export async function ingestDocument(source, text){
+    await pool.query('DELETE FROM chunks WHERE source = $1', [source]); 
+
     console.log("ingest.js, 存资料：切块 -> 变向量 -> 存进chunks表");
 
     const chunks = chunkText(text);
