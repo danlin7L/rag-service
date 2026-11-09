@@ -1,12 +1,18 @@
 services:
   db:
-    image: pgvector/pgvector:pg16 
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_PASSWORD: dev
     ports:
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+
+  # 缓存：同样的问题第二次直接从 Redis 拿答案，不再调用 embed + 搜索 + llama3.1
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
 
 volumes:
   pgdata:

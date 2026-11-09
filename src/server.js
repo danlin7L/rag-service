@@ -5,6 +5,7 @@
 import Fastify from 'fastify';
 import { ingestDocument } from './ingest.js';
 import { search } from './search.js';
+import { getCachedAnswer, setCachedAnswer } from './cache.js';
 
 const app = Fastify({ logger: true });
 
@@ -48,6 +49,12 @@ app.post('/query', async (req, reply) => {
     try {
         const { question } = req.body;
 
+        // 先查缓存：问过的问题直接返回，省掉 embed + 搜索 + llama3.1（几秒 → 几毫秒）
+        const cached = await getCachedAnswer(question);
+        if (cached) {
+            return { ...cached, cached: true };
+        }
+
         const chunks = await search(question);
         console.table(chunks.map(c => ({            // 打印每块的距离和两边的名次，看 hybrid 怎么排的
             position: c.position,
@@ -65,10 +72,12 @@ app.post('/query', async (req, reply) => {
         // 意思不够近，关键词也没怎么命中 → 资料里没有答案，直接说不知道，不调用 llama3.1
         const relevant = bestDistance <= MAX_DISTANCE || bestCoverage >= MIN_KEYWORD_COVERAGE;
         if (chunks.length === 0 || !relevant) {
-            return {
+            const result = {
                 answer: "I don't know",
                 sources: []
             };
+            await setCachedAnswer(question, result);   // "不知道" 也缓存，下次不用再 embed + 搜索
+            return { ...result, cached: false };
         }
 
         // Combine retrieved chunks into context
@@ -98,13 +107,15 @@ app.post('/query', async (req, reply) => {
 
         const data = await res.json();
 
-        return {
+        const result = {
             answer: data.response,
             sources: chunks.map(c => ({
                 source: c.source,
                 position: c.position
             }))
         };
+        await setCachedAnswer(question, result);       // 只缓存成功的答案；出错走 catch，不会被缓存
+        return { ...result, cached: false };
 
     } catch (error) {
         req.log.error(error);
@@ -122,11 +133,11 @@ app.post('/query', async (req, reply) => {
 
 try {
     await app.listen({
-        port: 3000,
+        port: Number(process.env.PORT) || 3000,   // 默认 3000；PORT=3001 node src/server.js 可以换端口
         host: '0.0.0.0'
     });
 
-    console.log('Server running at http://localhost:3000');
+    console.log(`Server running at http://localhost:${Number(process.env.PORT) || 3000}`);
 
 } catch (error) {
     app.log.error(error);
