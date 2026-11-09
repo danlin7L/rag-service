@@ -1,9 +1,10 @@
 
 // server.js
 // 正式服务：提供 /ingest 和 /query 两个接口
+// 摄取是异步的：要同时运行 node src/worker.js，否则任务只会排队不会被处理
 
 import Fastify from 'fastify';
-import { ingestDocument } from './ingest.js';
+import { ingestQueue } from './queue.js';
 import { search } from './search.js';
 import { getCachedAnswer, setCachedAnswer } from './cache.js';
 
@@ -17,27 +18,60 @@ const MIN_KEYWORD_COVERAGE = 0.8;
 
 // =====================================
 // 1. POST /ingest
-// 接收文档并存入数据库
+// 把文档放进队列，马上返回任务 id；worker.js 在后台切块、embed、存库
 // =====================================
 
 app.post('/ingest', async (req, reply) => {
     try {
-        const { source, text } = req.body;
+        const { source, text } = req.body ?? {};
 
-        const count = await ingestDocument(source, text);
+        // 在入队前就检查：坏数据进了队列只会失败 3 次，白白浪费重试
+        if (typeof source !== 'string' || !source || typeof text !== 'string' || !text) {
+            reply.code(400);
+            return { error: 'source and text are required strings' };
+        }
 
+        const job = await ingestQueue.add('ingest', { source, text });
+
+        reply.code(202);   // 202 Accepted：收到了，但还没处理完
         return {
-            source,
-            chunks: count
+            jobId: job.id,
+            status: 'queued',
+            statusUrl: `/ingest/${job.id}`
         };
     } catch (error) {
         req.log.error(error);
         reply.code(500);
 
         return {
-            error: 'Failed to ingest document'
+            error: 'Failed to queue document'
         };
     }
+});
+
+// =====================================
+// 1b. GET /ingest/:id
+// 查任务状态：waiting / active / completed / failed / delayed（等待重试）
+// =====================================
+
+app.get('/ingest/:id', async (req, reply) => {
+    const job = await ingestQueue.getJob(req.params.id);
+    if (!job) {
+        reply.code(404);
+        return { error: 'Job not found (unknown id, or already cleaned up)' };
+    }
+
+    const status = await job.getState();
+    return {
+        jobId: job.id,
+        source: job.data.source,
+        status,
+        progress: job.progress,          // 0~100
+        attempts: job.attemptsMade,
+        result: job.returnvalue ?? null, // 完成后：{ source, chunks }
+        // 失败或等待重试时：最后一次的错误信息。重试成功后就不显示了（旧错误已经不重要）
+        error: status === 'failed' || status === 'delayed' ? job.failedReason ?? null : null
+    };
 });
 
 // =====================================

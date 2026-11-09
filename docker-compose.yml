@@ -9,10 +9,15 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   # 缓存：同样的问题第二次直接从 Redis 拿答案，不再调用 embed + 搜索 + llama3.1
+  # 队列：/ingest 的任务也存在 Redis 里，由 worker.js 慢慢处理
   redis:
     image: redis:7-alpine
+    command: redis-server --appendonly yes   # 每次写入都记到磁盘（AOF），重启后排队中的任务还在
     ports:
       - "6379:6379"
+    volumes:
+      - redisdata:/data
 
 volumes:
   pgdata:
+  redisdata:
