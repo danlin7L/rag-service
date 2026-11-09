@@ -1,20 +1,14 @@
 
 // server.js
-// 正式服务：提供 /ingest 和 /query 两个接口
+// 正式服务：提供 /ingest、/query 和 /query/stream 接口
 // 摄取是异步的：要同时运行 node src/worker.js，否则任务只会排队不会被处理
 
 import Fastify from 'fastify';
 import { ingestQueue } from './queue.js';
-import { search } from './search.js';
+import { retrieve, generate, generateStream, IDK_ANSWER } from './rag.js';
 import { getCachedAnswer, setCachedAnswer } from './cache.js';
 
 const app = Fastify({ logger: true });
-
-// 距离阈值：相关问题约 0.39–0.42，无关问题约 0.64，取中间值
-const MAX_DISTANCE = 0.5;
-// 关键词覆盖率阈值：相关问题 1.0，无关问题最多 0.4；某块含有问题里 ≥80% 的关键词，也算找到了
-// （专有名词如 "Guisachan" 向量距离 0.61 会被误判，但关键词能精确命中）
-const MIN_KEYWORD_COVERAGE = 0.8;
 
 // =====================================
 // 1. POST /ingest
@@ -76,7 +70,7 @@ app.get('/ingest/:id', async (req, reply) => {
 
 // =====================================
 // 2. POST /query
-// 搜索相关文档，并调用 Llama 生成答案
+// 搜索相关文档，并调用 Llama 生成答案（等全部生成完再一次性返回）
 // =====================================
 
 app.post('/query', async (req, reply) => {
@@ -89,65 +83,12 @@ app.post('/query', async (req, reply) => {
             return { ...cached, cached: true };
         }
 
-        const chunks = await search(question);
-        console.table(chunks.map(c => ({            // 打印每块的距离和两边的名次，看 hybrid 怎么排的
-            position: c.position,
-            distance: c.distance.toFixed(3),
-            vector_rank: c.vector_rank,
-            keyword_rank: c.keyword_rank,
-            score: Number(c.score).toFixed(4),
-            coverage: (c.keyword_coverage ?? 0).toFixed(2)
-        })));
+        const { chunks, relevant, sources } = await retrieve(question);
 
-        // 结果按 RRF 分数排，第一块不一定最近，所以取最小距离来判断
-        const bestDistance = Math.min(...chunks.map(c => c.distance));
-        const bestCoverage = Math.max(...chunks.map(c => c.keyword_coverage ?? 0));
+        // 资料里没有答案 → 直接说不知道，不调用 llama3.1
+        const answer = relevant ? await generate(question, chunks) : IDK_ANSWER;
 
-        // 意思不够近，关键词也没怎么命中 → 资料里没有答案，直接说不知道，不调用 llama3.1
-        const relevant = bestDistance <= MAX_DISTANCE || bestCoverage >= MIN_KEYWORD_COVERAGE;
-        if (chunks.length === 0 || !relevant) {
-            const result = {
-                answer: "I don't know",
-                sources: []
-            };
-            await setCachedAnswer(question, result);   // "不知道" 也缓存，下次不用再 embed + 搜索
-            return { ...result, cached: false };
-        }
-
-        // Combine retrieved chunks into context
-        const context = chunks
-            .map(c => c.content)
-            .join('\n---\n');
-
-        // Call Ollama API
-        const res = await fetch(
-            'http://localhost:11434/api/generate',
-            {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    model: 'llama3.1',
-                    prompt: `Answer only using the context below. Context:${context}  Question: ${question}`,
-                    stream: false
-                })
-            }
-        );
-
-        if (!res.ok) {
-            throw new Error(`Ollama API error: ${res.status}`);
-        }
-
-        const data = await res.json();
-
-        const result = {
-            answer: data.response,
-            sources: chunks.map(c => ({
-                source: c.source,
-                position: c.position
-            }))
-        };
+        const result = { answer, sources };
         await setCachedAnswer(question, result);       // 只缓存成功的答案；出错走 catch，不会被缓存
         return { ...result, cached: false };
 
@@ -158,6 +99,88 @@ app.post('/query', async (req, reply) => {
         return {
             error: 'Failed to process query'
         };
+    }
+});
+
+// =====================================
+// 2b. GET /query/stream?question=...
+// SSE（Server-Sent Events）：llama3.1 生成一点就推一点，不用干等十几秒
+// 用 GET 是因为浏览器自带的 EventSource 只支持 GET
+//
+// 推送的事件依次是：
+//   event: sources  data: [{"source":...,"position":...}]   先告诉你用了哪些资料
+//   event: token    data: {"text":"Yes"}                     答案的一小段，会有很多个
+//   event: done     data: {"cached":false}                   结束
+//   event: error    data: {"error":"..."}                    出错（之后连接关闭）
+// =====================================
+
+// SSE 的格式：每条消息是 "event: 名字\ndata: 内容\n\n"（空行表示一条消息结束）
+// data 统一用 JSON：答案里可能有换行，原样写进去会把消息格式弄乱
+function sseSend(res, event, data) {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+app.get('/query/stream', async (req, reply) => {
+    const question = req.query.question;
+    if (typeof question !== 'string' || !question.trim()) {
+        reply.code(400);
+        return { error: 'question query parameter is required' };
+    }
+
+    // 接管原始的 Node response，Fastify 不再自动发送返回值；之后自己 write / end
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',   // 别缓存，每次都是新的流
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'      // 前面有 nginx 的话，让它别攒着不发
+    });
+
+    // 客户端中途关掉（关网页、Ctrl+C）→ 取消 Ollama 请求，别让它继续白白生成
+    // 注意要监听 res 的 close，不是 req 的：GET 请求读完就会触发 req 的 close
+    const abort = new AbortController();
+    res.on('close', () => {
+        if (!res.writableEnded) {
+            req.log.info('客户端断开了，取消生成');
+            abort.abort();
+        }
+    });
+
+    try {
+        // 缓存命中：一次把整个答案推过去
+        const cached = await getCachedAnswer(question);
+        if (cached) {
+            sseSend(res, 'sources', cached.sources);
+            sseSend(res, 'token', { text: cached.answer });
+            sseSend(res, 'done', { cached: true });
+            return res.end();
+        }
+
+        const { chunks, relevant, sources } = await retrieve(question);
+        sseSend(res, 'sources', sources);
+
+        let answer = '';
+        if (!relevant) {
+            answer = IDK_ANSWER;
+            sseSend(res, 'token', { text: answer });
+        } else {
+            for await (const text of generateStream(question, chunks, abort.signal)) {
+                answer += text;
+                sseSend(res, 'token', { text });
+            }
+        }
+
+        // 完整答案拼好后存缓存：下次 /query 和 /query/stream 都能用
+        await setCachedAnswer(question, { answer, sources });
+        sseSend(res, 'done', { cached: false });
+        res.end();
+
+    } catch (error) {
+        if (abort.signal.aborted) return;   // 客户端自己走了，不用报错，也不缓存半截答案
+        req.log.error(error);
+        sseSend(res, 'error', { error: 'Failed to process query' });
+        res.end();
     }
 });
 
