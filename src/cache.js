@@ -27,39 +27,61 @@ client.on('ready', () => {
 // 连上之前 client.isReady 是 false，下面的函数就当作没缓存
 client.connect().catch(() => {});
 
-// 问题 → key。先统一大小写和空格，"Sports?" 和 " sports? " 算同一个问题
+// 缓存版本号：每次 ingest 加 1。key 里带着版本号，版本一变，旧答案就全部“找不到”了
+// 注意名字不能以 answer: 开头，否则 clearAnswerCache 的 SCAN 会把它也删掉
+const VERSION_KEY = 'answer-version';
+
+// 问题 + 版本 → key。先统一大小写和空格，"Sports?" 和 " sports? " 算同一个问题
 // 用 sha256 是因为问题可能很长，key 短一点、长度固定
-function keyFor(question) {
+function keyFor(question, version) {
     const normalized = question.trim().toLowerCase().replace(/\s+/g, ' ');
-    return PREFIX + createHash('sha256').update(normalized).digest('hex');
+    return `${PREFIX}v${version}:` + createHash('sha256').update(normalized).digest('hex');
 }
 
-export async function getCachedAnswer(question) {
-    if (!client.isReady) return null;
+// 为什么不直接 get / set：
+//   /query 开始 → 用旧资料生成答案（要 10 秒）→ 这期间 ingest 写入新资料并清空缓存
+//   → /query 结束时把“旧答案”写进缓存 → 之后 1 小时大家都拿到旧答案
+// 解决：在请求一开始就记下版本号，最后按这个版本号写。中途 ingest 把版本号加了 1，
+//      这次的答案就写到旧版本下，没人会再读到它，等 TTL 到了自动删掉
+//
+// 用法：
+//   const cache = await openAnswerCache(question);   // 一定要在搜索之前调用
+//   if (cache.hit) return cache.hit;
+//   ...生成答案...
+//   await cache.save(result);
+export async function openAnswerCache(question) {
+    const noCache = { hit: null, save: async () => {} };
+    if (!client.isReady) return noCache;
     try {
-        const value = await client.get(keyFor(question));
-        return value ? JSON.parse(value) : null;
+        const version = Number(await client.get(VERSION_KEY)) || 0;
+        const key = keyFor(question, version);
+        const value = await client.get(key);
+        return {
+            hit: value ? JSON.parse(value) : null,
+            save: async result => {
+                if (!client.isReady) return;
+                try {
+                    await client.set(key, JSON.stringify(result), { EX: TTL_SECONDS });
+                } catch (err) {
+                    console.error('cache.js: 写缓存失败：', err.message);
+                }
+            }
+        };
     } catch (err) {
         console.error('cache.js: 读缓存失败：', err.message);
-        return null;
+        return noCache;
     }
 }
 
-export async function setCachedAnswer(question, result) {
-    if (!client.isReady) return;
-    try {
-        await client.set(keyFor(question), JSON.stringify(result), { EX: TTL_SECONDS });
-    } catch (err) {
-        console.error('cache.js: 写缓存失败：', err.message);
-    }
-}
-
-// 文档变了，旧答案可能就不对了 → 删掉所有 answer:* 的 key
+// 文档变了，旧答案可能就不对了：
+//   1. 版本号 +1 → 所有旧答案立刻失效（这一步才是关键）
+//   2. 再把旧的 answer:* key 删掉，省内存（不删也行，TTL 到了也会自动删）
 // 用 SCAN 分批找，不用 KEYS（KEYS 会一次扫完整个库，key 多时会卡住 Redis）
 export async function clearAnswerCache() {
     if (!client.isReady) return 0;
     let deleted = 0;
     try {
+        await client.incr(VERSION_KEY);
         for await (const keys of client.scanIterator({ MATCH: PREFIX + '*', COUNT: 100 })) {
             if (keys.length) deleted += await client.del(keys);
         }

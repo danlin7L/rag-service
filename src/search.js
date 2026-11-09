@@ -20,8 +20,10 @@ export async function search(question, k = 5){
          ),
          -- 2. 关键词搜索：字面匹配（名字、型号、专有名词更准）
          --    websearch_to_tsquery 默认是 AND（所有词都要出现），太严；把 & 换成 |，变成 OR
+         --    第二步要用 'simple'：websearch_to_tsquery 已经取过词根了，再用 'english' 会取第二次，
+         --    比如 response → respons → respon，就和存的 'respons' 对不上了（'simple' 只转小写，不改词）
          q AS (
-           SELECT to_tsquery('english', replace(websearch_to_tsquery('english', $2)::text, ' & ', ' | ')) AS query
+           SELECT to_tsquery('simple', replace(websearch_to_tsquery('english', $2)::text, ' & ', ' | ')) AS query
          ),
          -- 问题里的关键词列表，例如 {drawer,fit,new,older,unit}
          qw AS (

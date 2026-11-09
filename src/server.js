@@ -6,7 +6,7 @@
 import Fastify from 'fastify';
 import { ingestQueue } from './queue.js';
 import { retrieve, generate, generateStream, IDK_ANSWER } from './rag.js';
-import { getCachedAnswer, setCachedAnswer } from './cache.js';
+import { openAnswerCache } from './cache.js';
 
 const app = Fastify({ logger: true });
 
@@ -75,12 +75,17 @@ app.get('/ingest/:id', async (req, reply) => {
 
 app.post('/query', async (req, reply) => {
     try {
-        const { question } = req.body;
+        const { question } = req.body ?? {};   // 没有 body 时 req.body 是 undefined
+
+        if (typeof question !== 'string' || !question.trim()) {
+            reply.code(400);
+            return { error: 'question is required' };
+        }
 
         // 先查缓存：问过的问题直接返回，省掉 embed + 搜索 + llama3.1（几秒 → 几毫秒）
-        const cached = await getCachedAnswer(question);
-        if (cached) {
-            return { ...cached, cached: true };
+        const cache = await openAnswerCache(question);
+        if (cache.hit) {
+            return { ...cache.hit, cached: true };
         }
 
         const { chunks, relevant, sources } = await retrieve(question);
@@ -89,7 +94,7 @@ app.post('/query', async (req, reply) => {
         const answer = relevant ? await generate(question, chunks) : IDK_ANSWER;
 
         const result = { answer, sources };
-        await setCachedAnswer(question, result);       // 只缓存成功的答案；出错走 catch，不会被缓存
+        await cache.save(result);       // 只缓存成功的答案；出错走 catch，不会被缓存
         return { ...result, cached: false };
 
     } catch (error) {
@@ -149,10 +154,10 @@ app.get('/query/stream', async (req, reply) => {
 
     try {
         // 缓存命中：一次把整个答案推过去
-        const cached = await getCachedAnswer(question);
-        if (cached) {
-            sseSend(res, 'sources', cached.sources);
-            sseSend(res, 'token', { text: cached.answer });
+        const cache = await openAnswerCache(question);
+        if (cache.hit) {
+            sseSend(res, 'sources', cache.hit.sources);
+            sseSend(res, 'token', { text: cache.hit.answer });
             sseSend(res, 'done', { cached: true });
             return res.end();
         }
@@ -172,7 +177,7 @@ app.get('/query/stream', async (req, reply) => {
         }
 
         // 完整答案拼好后存缓存：下次 /query 和 /query/stream 都能用
-        await setCachedAnswer(question, { answer, sources });
+        await cache.save({ answer, sources });
         sseSend(res, 'done', { cached: false });
         res.end();
 
